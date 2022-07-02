@@ -1,1 +1,134 @@
-kakvmkakak
+/*
+  Pipeline to:
+    * (optionally) decrypt checked-in aes-256-cbc encrypted files
+    * init/apply/plan/destroy/destroy_plan/output terraform with an S3 State Backend
+
+  Pipeline Named Parameters:
+     *  tfPath - (REQUIRED) project relative path to the terraform config
+     *  tfVars - (REQUIRED) project relative path to the tfVars file
+     *  tfVersion - (OPTIONAL) 11/13  defaults to 11 - Version of Terraform to use
+     *  tfAction - (OPTIONAL) 'plan/apply/destroy/destroy_plan/output'
+               If not specified will ask user
+     *  awsRegion - (Optional) used to init terraform provider defaults to us-east-1
+     *  Terraform S3 Backend Variables (OPTIONAL)
+        * tfBackendBucket - Terraform S3 state bucket name
+        * tfBackendkey - Terraform state file name in the s3 bucket
+     *  secretsToDecrypt - (OPTIONAL) List of Objects describing checked in openssl aes-256-cbc encrypted files
+         to decrypt
+          [ {in: 'path_to_encrypted_file', out: 'path_to_decrypted_file'} ]
+     *  secretsCredentialId - (OPTIONAL) Jenkins Credential Id containing password to decrypt checked in files
+ */
+
+def call(body) {
+    def config = [:]
+    body.resolveStrategy = Closure.DELEGATE_FIRST
+    body.delegate = config
+    body()
+    node {
+        if ( ! config?.tfVars ) { error "Must supply pipeline variable 'tfVars'" }
+
+        def rootPath = env.WORKSPACE
+        def awsRegion = config?.awsRegion ?: 'us-east-1'
+        def terraform = config?.tfVersion ? "terraform.${config.tfVersion}" : 'terraform'
+        def terraformPluginsPath = config?.tfVersion == '13' ? "/var/terraform.${config.tfVersion}/plugins-cache" :
+                '/var/terraform/plugins-cache'
+        def tfAction = config?.tfAction
+        def tfTarget = ''
+        def validActions = ['plan', 'apply', 'destroy', 'destroy_plan', 'output']
+        def tfVarsFile = "${rootPath}/${config.tfVars}"
+        def terraformPath = config?.tfPath ? "${rootPath}/${config.tfPath}" : "${rootPath}/terraform"
+        def secretsToDecrypt = config?.secretsToDecrypt ? config.secretsToDecrypt : []
+        def secretCredentialId = config?.secretCredentialId
+
+        if ( ! tfAction ) {
+           def pipelineParams=[ ]
+           pipelineParams << choice(
+                   name: 'TF_ACTION',
+                   choices: validActions.join("\n"),
+                   description: 'Terraform Action to take')
+           pipelineParams << string(
+                   name: 'TF_TARGET',
+                   defaultValue: '',
+                   description: 'Terraform Target String - Blank Ignore')
+
+           properties([parameters(pipelineParams)])
+
+           tfAction =  params?.TF_ACTION
+           tfTarget =  params?.TF_TARGET
+           if ( ! tfAction ) {
+               currentBuild.result = 'ABORTED'
+               echo ('Pipeline user input parameters initialized. Aborting run.')
+               return
+           }
+        }
+
+        if ( ! validActions.contains(tfAction) ) {
+            error "Invalid Terraform Action '${tfAction}'.  Valid values: "+
+                    validActions.join(", ")
+        }
+
+        stage('Checkout Repo') {
+            cleanWs()
+            checkout scm
+        }
+
+        stage('Checking for TFVARS file'){
+            if ( ! fileExists(tfVarsFile) ) {
+                error "TFVARS File: '${tfVarsFile}' not found"
+            } else {
+                echo "Terraform Path: ${terraformPath}"
+                echo "Terraform TFVARS: ${tfVarsFile}"
+            }
+        }
+
+        if (secretCredentialId && secretsToDecrypt) {
+            stage('Decrypting Secrets'){
+                echo "Using Credentials: ${secretCredentialId}"
+                withCredentials([string(
+                        credentialsId: secretCredentialId,
+                        variable: 'secretPassword')]) {
+                    for(secret in secretsToDecrypt) {
+                        sh """openssl enc -aes-256-cbc \
+                        -salt \
+                        -d \
+                        -pass pass:${secretPassword} \
+                        -in '${rootPath}/${secret.in}' >  '${rootPath}/${secret.out}'
+                     """
+                    }
+                }
+            }
+        }
+
+        stage('Init terraform') {
+            def tfBackendBucket = config?.tfBackendBucket
+            def tfBackendKey = config?.tfBackendKey
+            def shCmd = (tfBackendBucket && tfBackendKey && awsRegion) ?
+               """cd '${terraformPath}'
+               ${terraform} init \
+                 -no-color \
+                 -plugin-dir="${terraformPluginsPath}" \\
+                 -backend-config="bucket=${tfBackendBucket}" \
+                 -backend-config="key=${tfBackendKey}" \
+                 -backend-config="region=${awsRegion}" """ :
+               "cd '${terraformPath}';${terraform} -no-color init"
+
+            echo shCmd
+            sh shCmd
+        }
+
+        stage('Run terraform') {
+            def shCmd = "export AWS_DEFAULT_REGION='${awsRegion}';cd '${terraformPath}';"
+            def tfOptions = "-no-color -var-file='${tfVarsFile}'"
+            if (tfAction in ['apply', 'destroy']) {
+                tfOptions = "-auto-approve ${tfOptions}"
+            }
+            if (tfTarget) {
+                tfOptions = "${tfOptions} -target='${tfTarget}'"
+            }
+
+            shCmd += "${terraform} ${tfAction} ${tfOptions}"
+            echo shCmd
+            sh shCmd
+        }
+    }
+}
