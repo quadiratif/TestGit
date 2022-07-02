@@ -1,0 +1,16 @@
+ cat jenkinsfile.stratos.devops
+@Library('runTerraform') _
+runTerraform{
+   tfVersion = "13"
+   tfBackendBucket = "netspend.stratos.terraform.backend"
+   tfBackendKey = "pinpoint.stratos.devops"
+   awsRegion = "us-east-1"
+   tfAction = ""
+   tfVars = "tfvars/stratos.devops.tfvars"
+   tfPath = "terraform"
+   secretCredentialId = "terraform_secrets_password"
+   secretsToDecrypt = [
+        [in: 'encrypted_secrets/stratos/brinks-gpr_fcm.key.enc',
+            out:'terraform/brinks-gpr_fcm.key'],
+        [in: 'encrypted_secrets/stratos/brinks-gpr_apns_token.p8.enc',
+           out:'terraform/brinks-gpr_apns_token.p8']
